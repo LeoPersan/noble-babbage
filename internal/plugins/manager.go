@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	goplugin "plugin"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -214,21 +215,9 @@ func (m *Manager) buildPlugin(ctx context.Context, repoPath, repoID string) (str
 	outputPath := filepath.Join(m.pluginsDir, fmt.Sprintf("plugin_%s_%d.so", repoID, ts))
 	appRoot := findAppRoot()
 
-	// Executa ajuste de replace e go mod download/tidy se go.mod existir
-	if fileExists(filepath.Join(repoPath, "go.mod")) {
-		// Ajusta automaticamente o replace para a localização real do SDK no container/ambiente
-		editCmd1 := exec.CommandContext(ctx, "go", "mod", "edit", "-replace=noble-babbage="+appRoot)
-		editCmd1.Dir = repoPath
-		_ = editCmd1.Run()
-
-		editCmd2 := exec.CommandContext(ctx, "go", "mod", "edit", "-replace=github.com/LeoPersan/noble-babbage="+appRoot)
-		editCmd2.Dir = repoPath
-		_ = editCmd2.Run()
-
-		tidyCmd := exec.CommandContext(ctx, "go", "mod", "tidy")
-		tidyCmd.Dir = repoPath
-		tidyCmd.Env = append(os.Environ(), "CGO_ENABLED=1")
-		_ = tidyCmd.Run()
+	// Prepara e isola o módulo do plugin gerando escopo único para subpacotes e ajustando replaces do SDK
+	if err := preparePluginModule(ctx, repoPath, repoID, ts, appRoot); err != nil {
+		return "", fmt.Errorf("falha ao preparar modulo do plugin: %w", err)
 	}
 
 	pluginPkg := fmt.Sprintf("plugin_%s_%d", sanitizePkgName(repoID), ts)
@@ -441,4 +430,172 @@ func sanitizePkgName(s string) string {
 	}
 	return res
 }
+
+func extractModuleName(data []byte) string {
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "module ") {
+			mod := strings.TrimSpace(strings.TrimPrefix(line, "module"))
+			mod = strings.Trim(mod, "`\"'")
+			if idx := strings.Index(mod, "//"); idx != -1 {
+				mod = strings.TrimSpace(mod[:idx])
+			}
+			return mod
+		}
+	}
+	return ""
+}
+
+func findLocalPackages(repoPath string) []string {
+	var pkgs []string
+	_ = filepath.Walk(repoPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil || !info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(repoPath, path)
+		if err != nil || rel == "." || strings.HasPrefix(rel, ".") || strings.HasPrefix(rel, "vendor") {
+			return nil
+		}
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return nil
+		}
+		hasGo := false
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".go") {
+				hasGo = true
+				break
+			}
+		}
+		if hasGo {
+			pkgs = append(pkgs, filepath.ToSlash(rel))
+		}
+		return nil
+	})
+	return pkgs
+}
+
+func rewriteImport(importPath string, localPkgs []string, origModule, uniqueModule string) string {
+	// Se for o SDK noble-babbage, nunca reescreve
+	if importPath == "noble-babbage" || strings.HasPrefix(importPath, "noble-babbage/") ||
+		importPath == "github.com/LeoPersan/noble-babbage" || strings.HasPrefix(importPath, "github.com/LeoPersan/noble-babbage/") {
+		return importPath
+	}
+
+	// Verifica se bate com algum subpacote local do repositório
+	for _, lp := range localPkgs {
+		if importPath == lp {
+			return uniqueModule + "/" + lp
+		}
+		if origModule != "" && importPath == origModule+"/"+lp {
+			return uniqueModule + "/" + lp
+		}
+		if strings.HasSuffix(importPath, "/"+lp) {
+			firstSegment := strings.Split(importPath, "/")[0]
+			if strings.HasPrefix(firstSegment, "p_") || !strings.Contains(firstSegment, ".") {
+				return uniqueModule + "/" + lp
+			}
+		}
+	}
+
+	// Se for o próprio módulo original sem subpacote
+	if origModule != "" && origModule != uniqueModule && importPath == origModule {
+		return uniqueModule
+	}
+
+	// Se começar com origModule/
+	if origModule != "" && origModule != uniqueModule && strings.HasPrefix(importPath, origModule+"/") {
+		return uniqueModule + strings.TrimPrefix(importPath, origModule)
+	}
+
+	return importPath
+}
+
+func preparePluginModule(ctx context.Context, repoPath, repoID string, ts int64, appRoot string) error {
+	goModPath := filepath.Join(repoPath, "go.mod")
+	if !fileExists(goModPath) {
+		return nil
+	}
+
+	data, err := os.ReadFile(goModPath)
+	if err != nil {
+		return fmt.Errorf("falha ao ler go.mod: %w", err)
+	}
+
+	origModule := extractModuleName(data)
+	uniqueModule := fmt.Sprintf("p_%s_%d", sanitizePkgName(repoID), ts)
+
+	// Atualiza o nome do módulo no go.mod
+	editModuleCmd := exec.CommandContext(ctx, "go", "mod", "edit", "-module="+uniqueModule)
+	editModuleCmd.Dir = repoPath
+	if out, err := editModuleCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("falha ao renomear modulo para %s: %v: %s", uniqueModule, err, string(out))
+	}
+
+	// Adiciona os replaces para o SDK do noble-babbage
+	editCmd1 := exec.CommandContext(ctx, "go", "mod", "edit", "-replace=noble-babbage="+appRoot)
+	editCmd1.Dir = repoPath
+	_ = editCmd1.Run()
+
+	editCmd2 := exec.CommandContext(ctx, "go", "mod", "edit", "-replace=github.com/LeoPersan/noble-babbage="+appRoot)
+	editCmd2.Dir = repoPath
+	_ = editCmd2.Run()
+
+	localPkgs := findLocalPackages(repoPath)
+
+	singleImportRe := regexp.MustCompile(`(?m)^(\s*import\s+(?:[a-zA-Z0-9_.]+\s+)?"([^"]+)")`)
+	multiImportRe := regexp.MustCompile(`(?s)import\s*\((.*?)\)`)
+	quotedStringRe := regexp.MustCompile(`"([^"]+)"`)
+
+	_ = filepath.Walk(repoPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		rel, _ := filepath.Rel(repoPath, path)
+		if strings.HasPrefix(rel, ".") || strings.HasPrefix(rel, "vendor") {
+			return nil
+		}
+
+		contentBytes, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		content := string(contentBytes)
+
+		// Substitui imports em blocos multi-linha: import ( ... )
+		newContent := multiImportRe.ReplaceAllStringFunc(content, func(match string) string {
+			return quotedStringRe.ReplaceAllStringFunc(match, func(quoted string) string {
+				imp := strings.Trim(quoted, `"`)
+				rewritten := rewriteImport(imp, localPkgs, origModule, uniqueModule)
+				return `"` + rewritten + `"`
+			})
+		})
+
+		// Substitui imports de linha única: import "..." ou import alias "..."
+		newContent = singleImportRe.ReplaceAllStringFunc(newContent, func(match string) string {
+			return quotedStringRe.ReplaceAllStringFunc(match, func(quoted string) string {
+				imp := strings.Trim(quoted, `"`)
+				rewritten := rewriteImport(imp, localPkgs, origModule, uniqueModule)
+				return `"` + rewritten + `"`
+			})
+		})
+
+		if newContent != content {
+			_ = os.WriteFile(path, []byte(newContent), info.Mode().Perm())
+		}
+		return nil
+	})
+
+	// Executa go mod tidy para reconciliar dependências e checksums
+	tidyCmd := exec.CommandContext(ctx, "go", "mod", "tidy")
+	tidyCmd.Dir = repoPath
+	tidyCmd.Env = append(os.Environ(), "CGO_ENABLED=1")
+	if out, err := tidyCmd.CombinedOutput(); err != nil {
+		log.Printf("[PluginManager] go mod tidy emitiu aviso para %s: %v: %s", repoID, err, string(out))
+	}
+
+	return nil
+}
+
 

@@ -513,4 +513,287 @@ var Plugin pluginSDK.RoutePlugin = &GitResetPlugin{}
 	}
 }
 
+// TestPluginUpdateWithSubpackages valida que um plugin contendo subpacotes (ex: internal/database) pode ser atualizado e recarregado
+func TestPluginUpdateWithSubpackages(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "noble-babbage-subpkg-test-*")
+	if err != nil {
+		t.Fatalf("falha ao criar temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	dbPath := filepath.Join(tempDir, "test.db")
+	cfg := &config.Config{
+		Port:          "8080",
+		AdminUser:     "admin",
+		AdminPassword: "admin",
+		DatabasePath:  dbPath,
+		SessionSecret: "secret-session-key",
+	}
+
+	db, err := database.NewDB(dbPath)
+	if err != nil {
+		t.Fatalf("falha ao inicializar banco: %v", err)
+	}
+	defer db.Close()
+
+	pm, err := plugins.NewManager(db, tempDir)
+	if err != nil {
+		t.Fatalf("falha ao inicializar manager: %v", err)
+	}
+
+	router := server.SetupRouter(cfg, db, pm)
+	workspaceAbs, _ := filepath.Abs("..")
+
+	pluginSrcDir := filepath.Join(tempDir, "subpkg_plugin_src")
+	if err := os.MkdirAll(filepath.Join(pluginSrcDir, "internal", "database"), 0755); err != nil {
+		t.Fatalf("falha ao criar subdirs: %v", err)
+	}
+
+	goModContent := `module subpkg-plugin
+
+go 1.24
+
+require (
+	github.com/go-chi/chi/v5 v5.2.1
+	noble-babbage v0.0.0
+)
+
+replace noble-babbage => ` + workspaceAbs + `
+`
+	_ = os.WriteFile(filepath.Join(pluginSrcDir, "go.mod"), []byte(goModContent), 0644)
+	if sumBytes, err := os.ReadFile(filepath.Join(workspaceAbs, "go.sum")); err == nil {
+		_ = os.WriteFile(filepath.Join(pluginSrcDir, "go.sum"), sumBytes, 0644)
+	}
+
+	// Subpacote internal/database v1
+	subpkgV1 := `package database
+
+func GetStatus() string {
+	return "db-v1-ok"
+}
+`
+	_ = os.WriteFile(filepath.Join(pluginSrcDir, "internal", "database", "db.go"), []byte(subpkgV1), 0644)
+
+	// main.go v1
+	mainV1 := `package main
+
+import (
+	"net/http"
+	"github.com/go-chi/chi/v5"
+	pluginSDK "noble-babbage/pkg/plugin"
+	"subpkg-plugin/internal/database"
+)
+
+type SubpkgPlugin struct{}
+
+func (p *SubpkgPlugin) Name() string { return "Subpkg Plugin" }
+func (p *SubpkgPlugin) BasePath() string { return "/subpkg-test" }
+func (p *SubpkgPlugin) RegisterRoutes(r chi.Router) {
+	r.Get("/", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write([]byte("Versao 1: " + database.GetStatus()))
+	})
+}
+
+var Plugin pluginSDK.RoutePlugin = &SubpkgPlugin{}
+`
+	_ = os.WriteFile(filepath.Join(pluginSrcDir, "main.go"), []byte(mainV1), 0644)
+
+	repo := &models.Repository{
+		Link:   pluginSrcDir,
+		Name:   "subpkg-plugin",
+		Status: models.StatusPending,
+	}
+	if err := db.Create(repo); err != nil {
+		t.Fatalf("falha ao criar repo: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	// 1. Primeira sincronização e build (v1)
+	if err := pm.SyncAndBuild(ctx, repo); err != nil {
+		t.Fatalf("SyncAndBuild v1 falhou: %v", err)
+	}
+
+	req1 := httptest.NewRequest(http.MethodGet, "/subpkg-test", nil)
+	rec1 := httptest.NewRecorder()
+	router.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK || !strings.Contains(rec1.Body.String(), "Versao 1: db-v1-ok") {
+		t.Fatalf("resposta v1 inesperada: code=%d body=%s", rec1.Code, rec1.Body.String())
+	}
+
+	// 2. Atualiza subpacote para v2
+	subpkgV2 := `package database
+
+func GetStatus() string {
+	return "db-v2-updated"
+}
+`
+	_ = os.WriteFile(filepath.Join(pluginSrcDir, "internal", "database", "db.go"), []byte(subpkgV2), 0644)
+
+	mainV2 := `package main
+
+import (
+	"net/http"
+	"github.com/go-chi/chi/v5"
+	pluginSDK "noble-babbage/pkg/plugin"
+	"subpkg-plugin/internal/database"
+)
+
+type SubpkgPlugin struct{}
+
+func (p *SubpkgPlugin) Name() string { return "Subpkg Plugin V2" }
+func (p *SubpkgPlugin) BasePath() string { return "/subpkg-test" }
+func (p *SubpkgPlugin) RegisterRoutes(r chi.Router) {
+	r.Get("/", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write([]byte("Versao 2: " + database.GetStatus()))
+	})
+}
+
+var Plugin pluginSDK.RoutePlugin = &SubpkgPlugin{}
+`
+	_ = os.WriteFile(filepath.Join(pluginSrcDir, "main.go"), []byte(mainV2), 0644)
+
+	// 3. Segunda sincronização e build (v2) - tenta atualizar o plugin
+	if err := pm.SyncAndBuild(ctx, repo); err != nil {
+		t.Fatalf("SyncAndBuild v2 falhou: %v", err)
+	}
+
+	req2 := httptest.NewRequest(http.MethodGet, "/subpkg-test", nil)
+	rec2 := httptest.NewRecorder()
+	router.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK || !strings.Contains(rec2.Body.String(), "Versao 2: db-v2-updated") {
+		t.Fatalf("resposta v2 inesperada: code=%d body=%s", rec2.Code, rec2.Body.String())
+	}
+}
+
+// TestPluginUpdateWithInterSubpackages valida que subpacotes que importam uns aos outros são reescritos e recarregados sem erro
+func TestPluginUpdateWithInterSubpackages(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "noble-babbage-interpkg-test-*")
+	if err != nil {
+		t.Fatalf("falha ao criar temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	dbPath := filepath.Join(tempDir, "test.db")
+	cfg := &config.Config{
+		Port:          "8080",
+		AdminUser:     "admin",
+		AdminPassword: "admin",
+		DatabasePath:  dbPath,
+		SessionSecret: "secret-session-key",
+	}
+
+	db, err := database.NewDB(dbPath)
+	if err != nil {
+		t.Fatalf("falha ao inicializar banco: %v", err)
+	}
+	defer db.Close()
+
+	pm, err := plugins.NewManager(db, tempDir)
+	if err != nil {
+		t.Fatalf("falha ao inicializar manager: %v", err)
+	}
+
+	router := server.SetupRouter(cfg, db, pm)
+	workspaceAbs, _ := filepath.Abs("..")
+
+	pluginSrcDir := filepath.Join(tempDir, "interpkg_plugin_src")
+	_ = os.MkdirAll(filepath.Join(pluginSrcDir, "internal", "database"), 0755)
+	_ = os.MkdirAll(filepath.Join(pluginSrcDir, "internal", "service"), 0755)
+
+	goModContent := `module interpkg-plugin
+
+go 1.24
+
+require (
+	github.com/go-chi/chi/v5 v5.2.1
+	noble-babbage v0.0.0
+)
+
+replace noble-babbage => ` + workspaceAbs + `
+`
+	_ = os.WriteFile(filepath.Join(pluginSrcDir, "go.mod"), []byte(goModContent), 0644)
+	if sumBytes, err := os.ReadFile(filepath.Join(workspaceAbs, "go.sum")); err == nil {
+		_ = os.WriteFile(filepath.Join(pluginSrcDir, "go.sum"), sumBytes, 0644)
+	}
+
+	// 1. database v1
+	_ = os.WriteFile(filepath.Join(pluginSrcDir, "internal", "database", "db.go"), []byte(`package database
+func QueryData() string { return "data-v1" }
+`), 0644)
+
+	// 2. service v1 (importa database)
+	_ = os.WriteFile(filepath.Join(pluginSrcDir, "internal", "service", "svc.go"), []byte(`package service
+import "interpkg-plugin/internal/database"
+func Process() string { return "svc-v1(" + database.QueryData() + ")" }
+`), 0644)
+
+	// 3. main v1 (importa service)
+	_ = os.WriteFile(filepath.Join(pluginSrcDir, "main.go"), []byte(`package main
+import (
+	"net/http"
+	"github.com/go-chi/chi/v5"
+	pluginSDK "noble-babbage/pkg/plugin"
+	"interpkg-plugin/internal/service"
+)
+
+type InterPlugin struct{}
+func (p *InterPlugin) Name() string { return "Inter Plugin" }
+func (p *InterPlugin) BasePath() string { return "/inter-test" }
+func (p *InterPlugin) RegisterRoutes(r chi.Router) {
+	r.Get("/", func(w http.ResponseWriter, req *http.Request) {
+		w.Write([]byte(service.Process()))
+	})
+}
+var Plugin pluginSDK.RoutePlugin = &InterPlugin{}
+`), 0644)
+
+	repo := &models.Repository{
+		Link:   pluginSrcDir,
+		Name:   "interpkg-plugin",
+		Status: models.StatusPending,
+	}
+	_ = db.Create(repo)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	if err := pm.SyncAndBuild(ctx, repo); err != nil {
+		t.Fatalf("SyncAndBuild v1 falhou: %v", err)
+	}
+
+	req1 := httptest.NewRequest(http.MethodGet, "/inter-test", nil)
+	rec1 := httptest.NewRecorder()
+	router.ServeHTTP(rec1, req1)
+	if rec1.Body.String() != "svc-v1(data-v1)" {
+		t.Fatalf("resposta v1 inesperada: %s", rec1.Body.String())
+	}
+
+	// Atualiza para v2
+	_ = os.WriteFile(filepath.Join(pluginSrcDir, "internal", "database", "db.go"), []byte(`package database
+func QueryData() string { return "data-v2-updated" }
+`), 0644)
+
+	_ = os.WriteFile(filepath.Join(pluginSrcDir, "internal", "service", "svc.go"), []byte(`package service
+import "interpkg-plugin/internal/database"
+func Process() string { return "svc-v2(" + database.QueryData() + ")" }
+`), 0644)
+
+	if err := pm.SyncAndBuild(ctx, repo); err != nil {
+		t.Fatalf("SyncAndBuild v2 falhou: %v", err)
+	}
+
+	req2 := httptest.NewRequest(http.MethodGet, "/inter-test", nil)
+	rec2 := httptest.NewRecorder()
+	router.ServeHTTP(rec2, req2)
+	if rec2.Body.String() != "svc-v2(data-v2-updated)" {
+		t.Fatalf("resposta v2 inesperada: %s", rec2.Body.String())
+	}
+}
+
+
+
 
