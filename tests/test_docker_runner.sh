@@ -6,7 +6,7 @@ CONTAINER_NAME="noble-babbage-live-test"
 WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "=========================================="
-echo " [TEST SUITE] Docker & Go Server Verification"
+echo " [TEST SUITE] Docker & Go Plugin Verification"
 echo "=========================================="
 
 cleanup() {
@@ -16,12 +16,12 @@ cleanup() {
 trap cleanup EXIT
 
 # 1. Build da imagem Docker
-echo "==> 1. Build da imagem Docker..."
+echo "==> 1. Build da imagem Docker com CGO e suporte a plugins..."
 docker build -t "${IMAGE_NAME}" "${WORKSPACE_DIR}"
 
-# 2. Executa testes unitários dentro do container Docker
-echo "==> 2. Executando testes unitários Go dentro do container Docker..."
-docker run --rm -v "${WORKSPACE_DIR}:/app" "${IMAGE_NAME}" go test -v ./...
+# 2. Executa testes unitários e de integração de plugins dentro do container Docker
+echo "==> 2. Executando testes unitários e de Go Plugin dentro do container Docker..."
+docker run --rm -v "${WORKSPACE_DIR}:/app" "${IMAGE_NAME}" go test -v ./tests/...
 
 # 3. Inicia o servidor HTTP no container em background
 echo "==> 3. Iniciando servidor HTTP dentro do container Docker..."

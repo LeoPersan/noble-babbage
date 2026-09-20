@@ -10,9 +10,10 @@ import (
 	"noble-babbage/internal/config"
 	"noble-babbage/internal/database"
 	"noble-babbage/internal/handlers"
+	"noble-babbage/internal/plugins"
 )
 
-func SetupRouter(cfg *config.Config, db *database.DB) *chi.Mux {
+func SetupRouter(cfg *config.Config, db *database.DB, pm *plugins.Manager) *chi.Mux {
 	r := chi.NewRouter()
 
 	r.Use(middleware.RequestID)
@@ -21,7 +22,12 @@ func SetupRouter(cfg *config.Config, db *database.DB) *chi.Mux {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(60 * time.Second))
 
-	adminHandler := handlers.NewAdminHandler(cfg, db)
+	// Middleware dinâmico para despachar requisições para os plugins Go carregados
+	if pm != nil {
+		r.Use(pm.DynamicRouterMiddleware)
+	}
+
+	adminHandler := handlers.NewAdminHandler(cfg, db, pm)
 
 	// Healthcheck
 	healthHandler := func(w http.ResponseWriter, r *http.Request) {
@@ -57,6 +63,7 @@ func SetupRouter(cfg *config.Config, db *database.DB) *chi.Mux {
 			protected.Get("/", adminHandler.AdminDashboard)
 			protected.Head("/", adminHandler.AdminDashboard)
 			protected.Post("/repos", adminHandler.CreateRepoWeb)
+			protected.Post("/repos/{id}/sync", adminHandler.SyncRepoWeb)
 			protected.Post("/repos/{id}/edit", adminHandler.EditRepoWeb)
 			protected.Post("/repos/{id}/delete", adminHandler.DeleteRepoWeb)
 
@@ -67,6 +74,7 @@ func SetupRouter(cfg *config.Config, db *database.DB) *chi.Mux {
 				api.Post("/", adminHandler.APICreate)
 				api.Get("/{id}", adminHandler.APIGetByID)
 				api.Head("/{id}", adminHandler.APIGetByID)
+				api.Post("/{id}/sync", adminHandler.APISync)
 				api.Put("/{id}", adminHandler.APIUpdate)
 				api.Delete("/{id}", adminHandler.APIDelete)
 			})

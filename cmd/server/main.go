@@ -8,11 +8,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"noble-babbage/internal/config"
 	"noble-babbage/internal/database"
+	"noble-babbage/internal/plugins"
 	"noble-babbage/internal/server"
 )
 
@@ -29,7 +31,24 @@ func main() {
 	}
 	defer db.Close()
 
-	router := server.SetupRouter(cfg, db)
+	// Inicializa o gerenciador de plugins dinâmicos
+	dataDir := filepath.Dir(cfg.DatabasePath)
+	if dataDir == "" || dataDir == "." {
+		dataDir = "data"
+	}
+	pm, err := plugins.NewManager(db, dataDir)
+	if err != nil {
+		log.Fatalf("Erro fatal ao inicializar gerenciador de plugins: %v", err)
+	}
+
+	// Sincroniza e carrega os repositórios previamente cadastrados em background
+	repos, err := db.GetAll()
+	if err == nil && len(repos) > 0 {
+		log.Printf("Sincronizando %d repositório(s) cadastrados em background...", len(repos))
+		pm.SyncAllRepos(repos)
+	}
+
+	router := server.SetupRouter(cfg, db, pm)
 
 	httpServer := &http.Server{
 		Addr:         ":" + cfg.Port,

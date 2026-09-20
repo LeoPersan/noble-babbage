@@ -11,7 +11,7 @@ services:
       - ADMIN_USER=${ADMIN_USER:-admin}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
       - DATABASE_PATH=/data/repos.db
-      - CGO_ENABLED=0
+      - CGO_ENABLED=1
       - GOCACHE=/tmp/gocache
     volumes:
       - .:/app

@@ -6,13 +6,24 @@ import (
 	"time"
 )
 
+const (
+	StatusPending  = "pending"
+	StatusBuilding = "building"
+	StatusActive   = "active"
+	StatusError    = "error"
+)
+
 type Repository struct {
-	ID        string    `json:"id"`
-	Link      string    `json:"link"`
-	Name      string    `json:"name"`
-	AccessKey string    `json:"access_key,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID             string     `json:"id"`
+	Link           string     `json:"link"`
+	Name           string     `json:"name"`
+	AccessKey      string     `json:"access_key,omitempty"`
+	Status         string     `json:"status"`
+	BasePath       string     `json:"base_path,omitempty"`
+	LastBuildAt    *time.Time `json:"last_build_at,omitempty"`
+	LastBuildError string     `json:"last_build_error,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
 }
 
 // MaskedAccessKey retorna a chave de acesso mascarada para visualização segura na UI
@@ -24,6 +35,18 @@ func (r Repository) MaskedAccessKey() string {
 		return "******"
 	}
 	return r.AccessKey[:3] + "..." + r.AccessKey[len(r.AccessKey)-3:]
+}
+
+// EffectiveBasePath calcula a rota final onde o plugin será exposto
+func (r Repository) EffectiveBasePath() string {
+	path := strings.TrimSpace(r.BasePath)
+	if path == "" {
+		path = "/" + r.Name
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return strings.TrimRight(path, "/")
 }
 
 // ExtractRepoName extrai automaticamente o nome do repositório a partir de URLs HTTP(S), SSH ou caminhos Git.

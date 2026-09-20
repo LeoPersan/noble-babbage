@@ -1,28 +1,33 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"noble-babbage/internal/auth"
 	"noble-babbage/internal/config"
 	"noble-babbage/internal/database"
 	"noble-babbage/internal/models"
+	"noble-babbage/internal/plugins"
 	"noble-babbage/internal/views"
 )
 
 type AdminHandler struct {
 	cfg *config.Config
 	db  *database.DB
+	pm  *plugins.Manager
 }
 
-func NewAdminHandler(cfg *config.Config, db *database.DB) *AdminHandler {
+func NewAdminHandler(cfg *config.Config, db *database.DB, pm *plugins.Manager) *AdminHandler {
 	return &AdminHandler{
 		cfg: cfg,
 		db:  db,
+		pm:  pm,
 	}
 }
 
@@ -102,6 +107,7 @@ func (h *AdminHandler) CreateRepoWeb(w http.ResponseWriter, r *http.Request) {
 		Link:      link,
 		Name:      name,
 		AccessKey: accessKey,
+		Status:    models.StatusPending,
 	}
 
 	if err := h.db.Create(repo); err != nil {
@@ -109,7 +115,35 @@ func (h *AdminHandler) CreateRepoWeb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.Redirect(w, r, "/admin?success="+url.QueryEscape("Repositório '"+repo.Name+"' cadastrado com sucesso!"), http.StatusSeeOther)
+	// Dispara a sincronização e compilação do plugin em background
+	if h.pm != nil {
+		go func(rp models.Repository) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			_ = h.pm.SyncAndBuild(ctx, &rp)
+		}(*repo)
+	}
+
+	http.Redirect(w, r, "/admin?success="+url.QueryEscape("Repositório '"+repo.Name+"' cadastrado! Sincronização e build iniciados."), http.StatusSeeOther)
+}
+
+func (h *AdminHandler) SyncRepoWeb(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	repo, err := h.db.GetByID(id)
+	if err != nil {
+		http.Redirect(w, r, "/admin?error="+url.QueryEscape("Repositório não encontrado"), http.StatusSeeOther)
+		return
+	}
+
+	if h.pm != nil {
+		go func(rp models.Repository) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			_ = h.pm.SyncAndBuild(ctx, &rp)
+		}(*repo)
+	}
+
+	http.Redirect(w, r, "/admin?success="+url.QueryEscape("Sincronização e build de '"+repo.Name+"' iniciados em background!"), http.StatusSeeOther)
 }
 
 func (h *AdminHandler) EditRepoWeb(w http.ResponseWriter, r *http.Request) {
@@ -153,6 +187,10 @@ func (h *AdminHandler) DeleteRepoWeb(w http.ResponseWriter, r *http.Request) {
 	if id == "" {
 		http.Redirect(w, r, "/admin?error="+url.QueryEscape("ID inválido"), http.StatusSeeOther)
 		return
+	}
+
+	if h.pm != nil {
+		h.pm.UnloadPlugin(id)
 	}
 
 	if err := h.db.Delete(id); err != nil {
@@ -208,11 +246,20 @@ func (h *AdminHandler) APICreate(w http.ResponseWriter, r *http.Request) {
 		Link:      strings.TrimSpace(req.Link),
 		Name:      strings.TrimSpace(req.Name),
 		AccessKey: strings.TrimSpace(req.AccessKey),
+		Status:    models.StatusPending,
 	}
 
 	if err := h.db.Create(repo); err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
+	}
+
+	if h.pm != nil {
+		go func(rp models.Repository) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			_ = h.pm.SyncAndBuild(ctx, &rp)
+		}(*repo)
 	}
 
 	respondJSON(w, http.StatusCreated, repo)
@@ -256,8 +303,33 @@ func (h *AdminHandler) APIUpdate(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, existing)
 }
 
+func (h *AdminHandler) APISync(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	repo, err := h.db.GetByID(id)
+	if err != nil {
+		respondJSON(w, http.StatusNotFound, map[string]string{"error": "Repositório não encontrado"})
+		return
+	}
+
+	if h.pm != nil {
+		go func(rp models.Repository) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			_ = h.pm.SyncAndBuild(ctx, &rp)
+		}(*repo)
+	}
+
+	respondJSON(w, http.StatusAccepted, map[string]string{
+		"message": "Sincronização e compilação do plugin iniciados",
+		"id":      id,
+	})
+}
+
 func (h *AdminHandler) APIDelete(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	if h.pm != nil {
+		h.pm.UnloadPlugin(id)
+	}
 	if err := h.db.Delete(id); err != nil {
 		respondJSON(w, http.StatusNotFound, map[string]string{"error": "Repositório não encontrado"})
 		return

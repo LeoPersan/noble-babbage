@@ -1,26 +1,149 @@
-# Servidor HTTP & Gerenciador de Repositórios (`noble-babbage`)
+# Servidor HTTP & Gerenciador de Go Plugins (`noble-babbage`)
 
-Aplicação web e API REST desenvolvida em Go para gerenciamento centralizado de repositórios Git, com painel administrativo `/admin`, autenticação via variáveis de ambiente e persistência em SQLite puro (`modernc.org/sqlite`).
+[![Build and Publish Container](https://github.com/LeoPersan/noble-babbage/actions/workflows/docker-build.yml/badge.svg)](https://github.com/LeoPersan/noble-babbage/actions/workflows/docker-build.yml)
+
+Aplicação web e plataforma centralizada para execução dinâmica de repositórios Go como plugins HTTP via `plugin.Open`, com painel administrativo `/admin`, autenticação e persistência em SQLite puro.
 
 ---
 
-## ✨ Funcionalidades
+## 🖥️ Como Importar e Rodar no ZimaOS (ou CasaOS)
 
-- **Painel Administrativo (`/admin`):**
-  - Interface Web HTML responsiva (estilizada com Tailwind CSS) para visualização e cadastro de repositórios.
-  - Tela de login amigável em `/admin/login` e encerramento de sessão em `/admin/logout`.
-  - Suporte a autenticação por **Cookie de Sessão** (navegador) e **HTTP Basic Auth** (APIs/CLI).
-- **CRUD de Repositórios:**
-  - **Link:** URL do repositório Git (HTTPS, SSH ou caminho Git).
-  - **Nome:** Opcional. Se omitido, é extraído automaticamente do link (ex: `https://github.com/torvalds/linux.git` -> `linux`).
-  - **Chave de Acesso:** Opcional. Suporta tokens de deploy / personal access tokens, com exibição mascarada na UI (`sec...123`).
-  - **Operações:** Listagem, Criação, Edição e Exclusão com feedback visual.
-- **API REST Integrada (`/admin/api/repos`):**
-  - Endpoints JSON para automação e integração externa protegidos por autenticação.
-- **Persistência SQLite:**
-  - Driver Go puro sem CGO (`modernc.org/sqlite`), compatível com qualquer arquitetura e `CGO_ENABLED=0`.
-- **Ambiente Docker Completo:**
-  - `Dockerfile` e `docker-compose.yml` prontos para execução e desenvolvimento.
+O **ZimaOS** permite a importação direta de aplicações através do formato Docker Compose (com suporte às extensões de metadados da App Store).
+
+### Método 1: Importação Direta via Docker Compose (Recomendado)
+
+1. Acesse o painel web do seu **ZimaOS**.
+2. Abra a **App Store**.
+3. Clique em **Custom Install** (botão `+` ou "Instalar app personalizado" no canto superior direito).
+4. No canto superior direito da janela de configuração, clique no ícone **Import** (importar).
+5. Cole o conteúdo YAML abaixo e clique em **Submit**:
+
+```yaml
+name: noble-babbage
+services:
+  app:
+    image: ghcr.io/leopersan/noble-babbage:latest
+    container_name: noble-babbage
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    environment:
+      - PORT=8080
+      - ADMIN_USER=admin
+      - ADMIN_PASSWORD=admin
+      - DATABASE_PATH=/data/repos.db
+      - CGO_ENABLED=1
+      - GOCACHE=/tmp/gocache
+    volumes:
+      - /DATA/AppData/noble-babbage/data:/data
+    x-casaos:
+      ports:
+        - container: "8080"
+          description:
+            en_us: Web UI & Admin Panel Port
+      volumes:
+        - container: /data
+          description:
+            en_us: Persistent SQLite database and dynamic plugins storage
+x-casaos:
+  architectures:
+    - amd64
+    - arm64
+  main: app
+  description:
+    en_us: Dynamic Go HTTP Plugin Server and Manager with Admin UI.
+  tagline:
+    en_us: Dynamic Go Plugins HTTP Platform
+  developer: LeoPersan
+  author: LeoPersan
+  icon: https://raw.githubusercontent.com/LeoPersan/noble-babbage/main/cmd/server/favicon.ico
+  thumbnail: ""
+  title:
+    en_us: Noble Babbage
+  category: Utilities
+  port_map: "8081"
+  index: /admin
+```
+
+6. O ZimaOS preencherá automaticamente os campos, ícone e portas. Clique em **Install** para iniciar o container!
+7. Acesse o painel administrativo clicando no ícone do app no ZimaOS ou diretamente via `http://<IP-DO-SEU-ZIMAOS>:8081/admin`.
+
+---
+
+### Método 2: Configuração Manual dos Campos no ZimaOS
+
+Se preferir preencher manualmente a tela do **Custom Install** do ZimaOS:
+
+| Campo na Interface | Valor |
+| :--- | :--- |
+| **App Name** | `Noble Babbage` |
+| **Image URL** | `ghcr.io/leopersan/noble-babbage:latest` |
+| **Web UI Port (Host)** | `8081` |
+| **Container Port** | `8080` |
+| **Web UI Path** | `/admin` |
+| **Volume (Host)** | `/DATA/AppData/noble-babbage/data` |
+| **Volume (Container)** | `/data` |
+| **Environment Variables** | `PORT=8080`<br>`ADMIN_USER=admin`<br>`ADMIN_PASSWORD=admin`<br>`DATABASE_PATH=/data/repos.db` |
+
+---
+
+## 🌟 Como Funciona o Padrão de Plugins
+
+Cada repositório Go cadastrado no painel `/admin` é baixado via `git clone/pull`, compilado dinamicamente com `-buildmode=plugin` em um arquivo `.so`, e suas rotas e telas web são montadas dinamicamente no servidor principal.
+
+### Contrato do Plugin (`pkg/plugin`)
+
+Os repositórios devem implementar a interface `pkg/plugin.RoutePlugin`:
+
+```go
+package main
+
+import (
+	"net/http"
+	"github.com/go-chi/chi/v5"
+	pluginSDK "noble-babbage/pkg/plugin"
+)
+
+type MeuAppPlugin struct{}
+
+func (p *MeuAppPlugin) Name() string {
+	return "Meu Aplicativo Web"
+}
+
+// BasePath define onde as rotas serão montadas (ex: http://localhost:8081/meu-app)
+func (p *MeuAppPlugin) BasePath() string {
+	return "/meu-app"
+}
+
+func (p *MeuAppPlugin) RegisterRoutes(r chi.Router) {
+	// Rota relativa raiz: /meu-app
+	r.Get("/", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte("<h1>Página Web do Plugin Carregado!</h1>"))
+	})
+
+	// Sub-rota: /meu-app/api/dados
+	r.Get("/api/dados", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"online","dados":[1,2,3]}`))
+	})
+}
+
+// Exporta o símbolo 'Plugin' obrigatório
+var Plugin pluginSDK.RoutePlugin = &MeuAppPlugin{}
+```
+
+---
+
+## 🚀 Painel Administrativo (`/admin`)
+
+- **Interface Web:** Cadastro de repositórios (HTTPS, SSH ou caminho local).
+- **Status do Plugin:**
+  - `Ativo`: Plugin compilado e rotas respondendo normalmente (com link direto clicável).
+  - `Compilando...`: Download do código e compilação em andamento.
+  - `Erro de Build`: Exibe o log detalhado do erro caso a compilação falhe.
+  - `Pendente`: Aguardando primeira sincronização.
+- **Botão "Sync & Build":** Dispara a atualização do repositório (`git pull`), recompilação e recarregamento a quente do plugin.
 
 ---
 
@@ -28,86 +151,22 @@ Aplicação web e API REST desenvolvida em Go para gerenciamento centralizado de
 
 | Variável | Padrão | Descrição |
 | :--- | :--- | :--- |
-| `PORT` | `8080` | Porta HTTP do servidor |
-| `ADMIN_USER` / `ADMIN_USERNAME` | `admin` | Nome de usuário para login administrativo |
-| `ADMIN_PASSWORD` | `admin` | Senha de acesso para o painel administrativo |
-| `DATABASE_PATH` | `data/repos.db` | Caminho do arquivo de banco de dados SQLite |
-| `SESSION_SECRET` | `session-secret-key-noble-babbage` | Chave secreta para assinatura dos cookies de sessão |
-
----
-
-## 🚀 Como Executar
-
-### Localmente (Go)
-
-```bash
-# Executa o servidor HTTP
-go run ./cmd/server
-```
-
-Acesse no navegador: [http://localhost:8080/admin](http://localhost:8080/admin)
-
-### Via Docker Compose
-
-```bash
-# Sobe o container
-docker compose up -d
-
-# Executa comandos no container
-docker exec -it go-container go run ./cmd/server
-```
-
----
-
-## 📡 Endpoints da API REST
-
-Todas as chamadas da API REST exigem autenticação via **HTTP Basic Auth** (`ADMIN_USER:ADMIN_PASSWORD`):
-
-### 1. Listar Repositórios
-```bash
-curl -u admin:admin http://localhost:8080/admin/api/repos
-```
-
-### 2. Cadastrar Repositório
-```bash
-# Com nome automático extraído do link
-curl -u admin:admin -X POST http://localhost:8080/admin/api/repos \
-  -H "Content-Type: application/json" \
-  -d '{"link":"https://github.com/torvalds/linux.git","access_key":"token-xyz"}'
-
-# Com nome personalizado
-curl -u admin:admin -X POST http://localhost:8080/admin/api/repos \
-  -H "Content-Type: application/json" \
-  -d '{"link":"https://github.com/usuario/meu-repo.git","name":"Meu Projeto","access_key":"token-123"}'
-```
-
-### 3. Obter Repositório por ID
-```bash
-curl -u admin:admin http://localhost:8080/admin/api/repos/{id}
-```
-
-### 4. Atualizar Repositório
-```bash
-curl -u admin:admin -X PUT http://localhost:8080/admin/api/repos/{id} \
-  -H "Content-Type: application/json" \
-  -d '{"name":"Novo Nome","access_key":"nova-chave"}'
-```
-
-### 5. Excluir Repositório
-```bash
-curl -u admin:admin -X DELETE http://localhost:8080/admin/api/repos/{id}
-```
+| `PORT` | `8080` | Porta HTTP interna do container |
+| `HOST_PORT` | `8081` | Porta exposta no host via Docker Compose |
+| `ADMIN_USER` / `ADMIN_USERNAME` | `admin` | Usuário de acesso ao `/admin` |
+| `ADMIN_PASSWORD` | `admin` | Senha de acesso ao `/admin` |
+| `DATABASE_PATH` | `/data/repos.db` | Arquivo do banco de dados SQLite |
 
 ---
 
 ## 🧪 Testes Automatizados
 
-Para executar os testes unitários e de integração locais:
+Executar testes locais de unit/plugin:
 ```bash
-go test -v ./...
+go test -v ./tests/...
 ```
 
-Para executar os testes automatizados de ponta a ponta no container Docker:
+Executar testes completos no container Docker:
 ```bash
 ./tests/test_docker_runner.sh
 ```

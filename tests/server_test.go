@@ -14,6 +14,7 @@ import (
 	"noble-babbage/internal/config"
 	"noble-babbage/internal/database"
 	"noble-babbage/internal/models"
+	"noble-babbage/internal/plugins"
 	"noble-babbage/internal/server"
 )
 
@@ -38,7 +39,12 @@ func setupTestEnvironment(t *testing.T) (*config.Config, *database.DB, http.Hand
 		t.Fatalf("falha ao inicializar banco de teste: %v", err)
 	}
 
-	router := server.SetupRouter(cfg, db)
+	pm, err := plugins.NewManager(db, tempDir)
+	if err != nil {
+		t.Fatalf("falha ao inicializar plugin manager: %v", err)
+	}
+
+	router := server.SetupRouter(cfg, db, pm)
 
 	cleanup := func() {
 		db.Close()
