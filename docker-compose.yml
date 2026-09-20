@@ -5,10 +5,23 @@ services:
     container_name: go-container
     restart: unless-stopped
     ports:
-      - "8081:8080"
+      - "${HOST_PORT:-8081}:8080"
     environment:
+      - PORT=8080
+      - ADMIN_USER=${ADMIN_USER:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
+      - DATABASE_PATH=/data/repos.db
       - CGO_ENABLED=0
       - GOCACHE=/tmp/gocache
     volumes:
       - .:/app
-    command: ["tail", "-f", "/dev/null"]
+      - ./data:/data
+      - go-pkg-cache:/go/pkg/mod
+      - go-build-cache:/tmp/gocache
+    command: ["go", "run", "./cmd/server"]
+
+volumes:
+  go-pkg-cache:
+    driver: local
+  go-build-cache:
+    driver: local

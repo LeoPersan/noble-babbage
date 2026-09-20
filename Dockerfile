@@ -13,9 +13,20 @@ RUN apk add --no-cache \
 # Define diretório de trabalho
 WORKDIR /app
 
-# Variáveis de ambiente
-ENV CGO_ENABLED=0 \
-    GOCACHE=/tmp/gocache
+# Variáveis de ambiente padrão
+ENV PORT=8080 \
+    CGO_ENABLED=0 \
+    GOCACHE=/tmp/gocache \
+    ADMIN_USER=admin \
+    ADMIN_PASSWORD=admin \
+    DATABASE_PATH=/data/repos.db
 
-# Ponto de entrada que mantém o container rodando aguardando comandos/execução
-CMD ["tail", "-f", "/dev/null"]
+# Expõe a porta do servidor HTTP
+EXPOSE 8080
+
+# Healthcheck nativo
+HEALTHCHECK --interval=15s --timeout=5s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# Ponto de entrada padrão: executa o servidor HTTP Go
+CMD ["go", "run", "./cmd/server"]
