@@ -32,11 +32,13 @@ type LoadedPlugin struct {
 }
 
 type Manager struct {
-	mu         sync.RWMutex
-	plugins    map[string]*LoadedPlugin // keyed by RepoID
-	db         *database.DB
-	reposDir   string
-	pluginsDir string
+	mu            sync.RWMutex
+	plugins       map[string]*LoadedPlugin // keyed by RepoID
+	buildingMu    sync.Mutex
+	buildingRepos map[string]bool // deduplica builds concorrentes para o mesmo repo
+	db            *database.DB
+	reposDir      string
+	pluginsDir    string
 }
 
 func NewManager(db *database.DB, dataDir string) (*Manager, error) {
@@ -51,15 +53,31 @@ func NewManager(db *database.DB, dataDir string) (*Manager, error) {
 	}
 
 	return &Manager{
-		plugins:    make(map[string]*LoadedPlugin),
-		db:         db,
-		reposDir:   reposDir,
-		pluginsDir: pluginsDir,
+		plugins:       make(map[string]*LoadedPlugin),
+		buildingRepos: make(map[string]bool),
+		db:            db,
+		reposDir:      reposDir,
+		pluginsDir:    pluginsDir,
 	}, nil
 }
 
 // SyncAndBuild clona/atualiza o repositório, compila como .so e carrega dinamicamente
 func (m *Manager) SyncAndBuild(ctx context.Context, repo *models.Repository) error {
+	m.buildingMu.Lock()
+	if m.buildingRepos[repo.ID] {
+		m.buildingMu.Unlock()
+		log.Printf("[PluginManager] Sincronização para '%s' (%s) já em andamento, ignorando chamada concorrente.", repo.Name, repo.ID)
+		return nil
+	}
+	m.buildingRepos[repo.ID] = true
+	m.buildingMu.Unlock()
+
+	defer func() {
+		m.buildingMu.Lock()
+		delete(m.buildingRepos, repo.ID)
+		m.buildingMu.Unlock()
+	}()
+
 	log.Printf("[PluginManager] Iniciando sincronização e build para o repositório '%s' (%s)...", repo.Name, repo.ID)
 
 	// Atualiza status para 'building' no banco
@@ -203,6 +221,15 @@ func (m *Manager) buildPlugin(ctx context.Context, repoPath, repoID string) (str
 func (m *Manager) loadPluginFile(soPath string, repo *models.Repository) (*LoadedPlugin, error) {
 	p, err := goplugin.Open(soPath)
 	if err != nil {
+		if strings.Contains(err.Error(), "already loaded") {
+			m.mu.RLock()
+			existing, ok := m.plugins[repo.ID]
+			m.mu.RUnlock()
+			if ok && existing != nil {
+				log.Printf("[PluginManager] Plugin '%s' já estava carregado no runtime. Mantendo montagem ativa.", repo.Name)
+				return existing, nil
+			}
+		}
 		return nil, fmt.Errorf("falha ao abrir plugin: %w", err)
 	}
 
