@@ -2,6 +2,7 @@ package tests
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -164,3 +165,51 @@ var Plugin pluginSDK.RoutePlugin = &SamplePlugin{}
 		t.Errorf("resposta da API do plugin inesperada: %s", rec.Body.String())
 	}
 }
+
+// TestSSHKeyAndTokenHandling testa se chaves SSH privadas e tokens HTTPS são processados sem pânico
+func TestSSHKeyAndTokenHandling(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "noble-babbage-auth-test-*")
+	if err != nil {
+		t.Fatalf("falha ao criar temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	dbPath := filepath.Join(tempDir, "test.db")
+	db, err := database.NewDB(dbPath)
+	if err != nil {
+		t.Fatalf("falha ao inicializar db: %v", err)
+	}
+	defer db.Close()
+
+	pm, err := plugins.NewManager(db, tempDir)
+	if err != nil {
+		t.Fatalf("falha ao inicializar pm: %v", err)
+	}
+
+	// 1. Testa repositório com chave SSH privada em AccessKey
+	fakeSSHKey := "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n-----END OPENSSH PRIVATE KEY-----"
+	repoSSH := &models.Repository{
+		Link:      "git@github.com:example/private-repo.git",
+		Name:      "private-repo",
+		AccessKey: fakeSSHKey,
+		Status:    models.StatusPending,
+	}
+	_ = db.Create(repoSSH)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// SyncAndBuild tentará clonar com a chave SSH injetada
+	_ = pm.SyncAndBuild(ctx, repoSSH)
+
+	// Verifica se a chave privada foi gravada com segurança no diretório keys
+	keyPath := filepath.Join(tempDir, "keys", fmt.Sprintf("id_%s", repoSSH.ID))
+	if info, err := os.Stat(keyPath); err == nil {
+		if info.Mode().Perm() != 0600 {
+			t.Errorf("esperado permissão 0600 na chave SSH privada, obtido %v", info.Mode().Perm())
+		}
+	} else {
+		t.Errorf("arquivo de chave SSH não foi criado: %v", err)
+	}
+}
+

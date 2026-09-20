@@ -6,6 +6,7 @@ RUN apk add --no-cache \
     tzdata \
     curl \
     git \
+    openssh-client \
     bash \
     make \
     gcc \

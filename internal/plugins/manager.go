@@ -109,10 +109,25 @@ func (m *Manager) syncGitRepo(ctx context.Context, repo *models.Repository) (str
 	targetDir := filepath.Join(m.reposDir, repo.ID)
 	cloneURL := repo.Link
 
-	// Injeta AccessKey na URL HTTPS se informada
-	if repo.AccessKey != "" && (strings.HasPrefix(repo.Link, "https://") || strings.HasPrefix(repo.Link, "http://")) {
+	var extraEnv []string
+
+	// Suporte para chave privada SSH inserida diretamente no campo AccessKey
+	if repo.AccessKey != "" && strings.Contains(repo.AccessKey, "PRIVATE KEY") {
+		keysDir := filepath.Join(filepath.Dir(m.reposDir), "keys")
+		_ = os.MkdirAll(keysDir, 0700)
+		keyPath := filepath.Join(keysDir, fmt.Sprintf("id_%s", repo.ID))
+
+		keyContent := strings.TrimSpace(repo.AccessKey) + "\n"
+		if err := os.WriteFile(keyPath, []byte(keyContent), 0600); err == nil {
+			extraEnv = append(extraEnv, fmt.Sprintf("GIT_SSH_COMMAND=ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null", keyPath))
+		}
+	} else if strings.HasPrefix(repo.Link, "git@") || strings.HasPrefix(repo.Link, "ssh://") {
+		// Evita travamento interativo na confirmação de host keys em background
+		extraEnv = append(extraEnv, "GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=accept-new")
+	} else if repo.AccessKey != "" && (strings.HasPrefix(repo.Link, "https://") || strings.HasPrefix(repo.Link, "http://")) {
+		// Injeta AccessKey (Personal Access Token) na URL HTTPS
 		if u, err := url.Parse(repo.Link); err == nil {
-			u.User = url.UserPassword("oauth2", repo.AccessKey)
+			u.User = url.UserPassword("x-access-token", repo.AccessKey)
 			cloneURL = u.String()
 		}
 	}
@@ -121,6 +136,7 @@ func (m *Manager) syncGitRepo(ctx context.Context, repo *models.Repository) (str
 		// Repositório já existe, realiza pull
 		cmd := exec.CommandContext(ctx, "git", "pull", "--ff-only")
 		cmd.Dir = targetDir
+		cmd.Env = append(os.Environ(), extraEnv...)
 		var out bytes.Buffer
 		cmd.Stdout = &out
 		cmd.Stderr = &out
@@ -128,12 +144,14 @@ func (m *Manager) syncGitRepo(ctx context.Context, repo *models.Repository) (str
 			// Se falhar o pull rápido, tenta reset
 			resetCmd := exec.CommandContext(ctx, "git", "fetch", "--all")
 			resetCmd.Dir = targetDir
+			resetCmd.Env = append(os.Environ(), extraEnv...)
 			_ = resetCmd.Run()
 		}
 	} else {
 		// Repositório novo, realiza clone
 		_ = os.RemoveAll(targetDir)
 		cmd := exec.CommandContext(ctx, "git", "clone", "--depth", "1", cloneURL, targetDir)
+		cmd.Env = append(os.Environ(), extraEnv...)
 		var out bytes.Buffer
 		cmd.Stdout = &out
 		cmd.Stderr = &out
