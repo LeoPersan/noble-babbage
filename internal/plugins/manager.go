@@ -119,7 +119,7 @@ func (m *Manager) syncGitRepo(ctx context.Context, repo *models.Repository) (str
 	// Suporte para diretório local no host (ótimo para testes e desenvolvimento)
 	if strings.HasPrefix(repo.Link, "/") || strings.HasPrefix(repo.Link, "./") || strings.HasPrefix(repo.Link, "../") {
 		absPath, err := filepath.Abs(repo.Link)
-		if err == nil && fileExists(absPath) {
+		if err == nil && fileExists(absPath) && fileExists(filepath.Join(absPath, "go.mod")) {
 			return absPath, nil
 		}
 	}
@@ -151,19 +151,47 @@ func (m *Manager) syncGitRepo(ctx context.Context, repo *models.Repository) (str
 	}
 
 	if fileExists(filepath.Join(targetDir, ".git")) {
-		// Repositório já existe, realiza pull
-		cmd := exec.CommandContext(ctx, "git", "pull", "--ff-only")
-		cmd.Dir = targetDir
-		cmd.Env = append(os.Environ(), extraEnv...)
-		var out bytes.Buffer
-		cmd.Stdout = &out
-		cmd.Stderr = &out
-		if err := cmd.Run(); err != nil {
-			// Se falhar o pull rápido, tenta reset
-			resetCmd := exec.CommandContext(ctx, "git", "fetch", "--all")
-			resetCmd.Dir = targetDir
-			resetCmd.Env = append(os.Environ(), extraEnv...)
-			_ = resetCmd.Run()
+		// Repositório já existe: limpa alterações locais geradas por builds anteriores (go mod edit/tidy, etc.)
+		resetHardCmd := exec.CommandContext(ctx, "git", "reset", "--hard", "HEAD")
+		resetHardCmd.Dir = targetDir
+		resetHardCmd.Env = append(os.Environ(), extraEnv...)
+		_ = resetHardCmd.Run()
+
+		cleanCmd := exec.CommandContext(ctx, "git", "clean", "-fd")
+		cleanCmd.Dir = targetDir
+		cleanCmd.Env = append(os.Environ(), extraEnv...)
+		_ = cleanCmd.Run()
+
+		// Busca atualizações de todos os remotos
+		fetchCmd := exec.CommandContext(ctx, "git", "fetch", "--all", "--prune")
+		fetchCmd.Dir = targetDir
+		fetchCmd.Env = append(os.Environ(), extraEnv...)
+		var fetchOut bytes.Buffer
+		fetchCmd.Stdout = &fetchOut
+		fetchCmd.Stderr = &fetchOut
+		if err := fetchCmd.Run(); err != nil {
+			log.Printf("[PluginManager] git fetch avisou para %s (%s): %v: %s", repo.Name, repo.ID, err, fetchOut.String())
+		}
+
+		// Tenta realizar o pull das novas alterações
+		pullCmd := exec.CommandContext(ctx, "git", "pull", "--ff-only")
+		pullCmd.Dir = targetDir
+		pullCmd.Env = append(os.Environ(), extraEnv...)
+		var pullOut bytes.Buffer
+		pullCmd.Stdout = &pullOut
+		pullCmd.Stderr = &pullOut
+
+		if err := pullCmd.Run(); err != nil {
+			// Se o pull falhar (ex: histórico divergente), força reset para o upstream ou origin/HEAD
+			upstreamReset := exec.CommandContext(ctx, "git", "reset", "--hard", "@{u}")
+			upstreamReset.Dir = targetDir
+			upstreamReset.Env = append(os.Environ(), extraEnv...)
+			if uErr := upstreamReset.Run(); uErr != nil {
+				originReset := exec.CommandContext(ctx, "git", "reset", "--hard", "origin/HEAD")
+				originReset.Dir = targetDir
+				originReset.Env = append(os.Environ(), extraEnv...)
+				_ = originReset.Run()
+			}
 		}
 	} else {
 		// Repositório novo, realiza clone
@@ -182,7 +210,8 @@ func (m *Manager) syncGitRepo(ctx context.Context, repo *models.Repository) (str
 }
 
 func (m *Manager) buildPlugin(ctx context.Context, repoPath, repoID string) (string, error) {
-	outputPath := filepath.Join(m.pluginsDir, fmt.Sprintf("plugin_%s_%d.so", repoID, time.Now().UnixNano()))
+	ts := time.Now().UnixNano()
+	outputPath := filepath.Join(m.pluginsDir, fmt.Sprintf("plugin_%s_%d.so", repoID, ts))
 	appRoot := findAppRoot()
 
 	// Executa ajuste de replace e go mod download/tidy se go.mod existir
@@ -202,8 +231,16 @@ func (m *Manager) buildPlugin(ctx context.Context, repoPath, repoID string) (str
 		_ = tidyCmd.Run()
 	}
 
-	// Compila o plugin com -buildmode=plugin
-	buildCmd := exec.CommandContext(ctx, "go", "build", "-buildmode=plugin", "-o", outputPath, ".")
+	pluginPkg := fmt.Sprintf("plugin_%s_%d", sanitizePkgName(repoID), ts)
+
+	// Compila o plugin com -buildmode=plugin e identificador único de pacote para permitir hot-reload
+	buildCmd := exec.CommandContext(ctx, "go", "build",
+		"-buildmode=plugin",
+		"-gcflags=-p="+pluginPkg,
+		"-ldflags=-pluginpath="+pluginPkg,
+		"-o", outputPath,
+		".",
+	)
 	buildCmd.Dir = repoPath
 	buildCmd.Env = append(os.Environ(), "CGO_ENABLED=1")
 
@@ -221,15 +258,6 @@ func (m *Manager) buildPlugin(ctx context.Context, repoPath, repoID string) (str
 func (m *Manager) loadPluginFile(soPath string, repo *models.Repository) (*LoadedPlugin, error) {
 	p, err := goplugin.Open(soPath)
 	if err != nil {
-		if strings.Contains(err.Error(), "already loaded") {
-			m.mu.RLock()
-			existing, ok := m.plugins[repo.ID]
-			m.mu.RUnlock()
-			if ok && existing != nil {
-				log.Printf("[PluginManager] Plugin '%s' já estava carregado no runtime. Mantendo montagem ativa.", repo.Name)
-				return existing, nil
-			}
-		}
 		return nil, fmt.Errorf("falha ao abrir plugin: %w", err)
 	}
 
@@ -397,3 +425,20 @@ func findAppRoot() string {
 	}
 	return "/app"
 }
+
+func sanitizePkgName(s string) string {
+	var sb strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+			sb.WriteRune(r)
+		} else {
+			sb.WriteRune('_')
+		}
+	}
+	res := sb.String()
+	if res == "" {
+		res = "plugin"
+	}
+	return res
+}
+
