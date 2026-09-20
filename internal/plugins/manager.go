@@ -117,7 +117,7 @@ func (m *Manager) syncGitRepo(ctx context.Context, repo *models.Repository) (str
 		_ = os.MkdirAll(keysDir, 0700)
 		keyPath := filepath.Join(keysDir, fmt.Sprintf("id_%s", repo.ID))
 
-		keyContent := strings.TrimSpace(repo.AccessKey) + "\n"
+		keyContent := normalizePrivateKey(repo.AccessKey)
 		if err := os.WriteFile(keyPath, []byte(keyContent), 0600); err == nil {
 			extraEnv = append(extraEnv, fmt.Sprintf("GIT_SSH_COMMAND=ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null", keyPath))
 		}
@@ -313,4 +313,30 @@ func (m *Manager) SyncAllRepos(repos []models.Repository) {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+func normalizePrivateKey(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if !strings.Contains(trimmed, "PRIVATE KEY") {
+		return trimmed
+	}
+	// Se já contiver quebras de linha normais, apenas garante terminação limpa
+	if strings.Count(trimmed, "\n") >= 2 {
+		return strings.ReplaceAll(trimmed, "\r\n", "\n") + "\n"
+	}
+	// Se foi colada em um campo de texto de linha única e as quebras viraram espaços
+	beginIdx := strings.Index(trimmed, "-----BEGIN ")
+	endIdx := strings.Index(trimmed, "-----END ")
+	if beginIdx != -1 && endIdx != -1 && endIdx > beginIdx {
+		headerEndRelative := strings.Index(trimmed[beginIdx+11:], "-----")
+		if headerEndRelative != -1 {
+			headerEnd := beginIdx + 11 + headerEndRelative + 5
+			header := trimmed[beginIdx:headerEnd]
+			footer := trimmed[endIdx:]
+			body := strings.TrimSpace(trimmed[headerEnd:endIdx])
+			bodyWords := strings.Fields(body)
+			return header + "\n" + strings.Join(bodyWords, "\n") + "\n" + footer + "\n"
+		}
+	}
+	return trimmed + "\n"
 }
