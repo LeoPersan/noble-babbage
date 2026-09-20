@@ -165,9 +165,19 @@ func (m *Manager) syncGitRepo(ctx context.Context, repo *models.Repository) (str
 
 func (m *Manager) buildPlugin(ctx context.Context, repoPath, repoID string) (string, error) {
 	outputPath := filepath.Join(m.pluginsDir, fmt.Sprintf("plugin_%s_%d.so", repoID, time.Now().UnixNano()))
+	appRoot := findAppRoot()
 
-	// Executa go mod download/tidy se go.mod existir
+	// Executa ajuste de replace e go mod download/tidy se go.mod existir
 	if fileExists(filepath.Join(repoPath, "go.mod")) {
+		// Ajusta automaticamente o replace para a localização real do SDK no container/ambiente
+		editCmd1 := exec.CommandContext(ctx, "go", "mod", "edit", "-replace=noble-babbage="+appRoot)
+		editCmd1.Dir = repoPath
+		_ = editCmd1.Run()
+
+		editCmd2 := exec.CommandContext(ctx, "go", "mod", "edit", "-replace=github.com/LeoPersan/noble-babbage="+appRoot)
+		editCmd2.Dir = repoPath
+		_ = editCmd2.Run()
+
 		tidyCmd := exec.CommandContext(ctx, "go", "mod", "tidy")
 		tidyCmd.Dir = repoPath
 		tidyCmd.Env = append(os.Environ(), "CGO_ENABLED=1")
@@ -339,4 +349,24 @@ func normalizePrivateKey(raw string) string {
 		}
 	}
 	return trimmed + "\n"
+}
+
+func findAppRoot() string {
+	if fileExists("/app/go.mod") {
+		return "/app"
+	}
+	if wd, err := os.Getwd(); err == nil {
+		dir := wd
+		for {
+			if fileExists(filepath.Join(dir, "go.mod")) {
+				return dir
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+	return "/app"
 }
