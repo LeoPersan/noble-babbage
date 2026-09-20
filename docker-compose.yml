@@ -2,6 +2,7 @@ services:
   app:
     build:
       context: .
+      network: host
     container_name: go-container
     restart: unless-stopped
     ports:
