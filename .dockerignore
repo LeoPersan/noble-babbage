@@ -1,0 +1,17 @@
+server
+app-server
+main
+*.exe
+*.dll
+*.so
+*.dylib
+data/*.db
+data/*.db-*
+*.db
+coverage.out
+coverage.html
+.git
+.idea
+.vscode
+tests/tmp*
+tmp/
